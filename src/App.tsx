@@ -41,7 +41,8 @@ import { SkeletonUtils } from 'three-stdlib';
 import { useControls } from 'leva';
 import { create } from 'zustand';
 
-// V160: Raycast EXCLUDE_DYNAMIC 적용으로 플레이어 자가 차폐 문제 해결 및 최종 안정화
+// V182: 플레이어 모델 자가 투과(Self-Transparency) 현상 수정
+// PlayerVisuals에서 material.transparent = false 강제 적용
 
 // 🟢 전역 상태 관리 (Zustand)
 interface GameState {
@@ -110,7 +111,6 @@ const DASH_SPEED = 6.2;
 const AIR_SPEED = 2;
 const JUMP_ANIM_START_TIME = 0.6;
 
-// 시야 거리 및 정책 설정
 const VIEW_DISTANCE = 10;
 const RED_ZONE_DIST = 7;
 const HEIGHT_THRESHOLD = 3;
@@ -118,7 +118,6 @@ const FOV = 60;
 const VERTICAL_FOV = 30;
 
 // 🧱 충돌 그룹 설정 (Bitmask)
-// Level(2) | RayVision(Group 1만 감지)
 const GROUP_LEVEL = 196607;
 const GROUP_RAY_VISION = 65538;
 
@@ -144,7 +143,7 @@ const Bush = ({ position }: { position: [number, number, number] }) => {
   );
 };
 
-// 동적 시야각 컴포넌트 (시각적 표현용)
+// 동적 시야각 컴포넌트
 const DynamicVisionCone = ({
                              parentBody,
                              rayCount = 60,
@@ -198,18 +197,16 @@ const DynamicVisionCone = ({
 
     for (let i = 0; i <= rayCount; i++) {
       const localAngle = -halfFov + (angleStep * i);
-
       const meshRotationY = Math.atan2(worldDir.x, worldDir.z);
       const worldRayAngle = meshRotationY + localAngle;
 
       const dx = Math.sin(worldRayAngle);
       const dz = Math.cos(worldRayAngle);
 
-      const rayOrigin = { x: worldPos.x, y: worldPos.y, z: worldPos.z };
+      const rayOrigin = { x: worldPos.x, y: worldPos.y + 1.7, z: worldPos.z };
       const rayDirection = { x: dx, y: 0, z: dz };
       const ray = new rapier.Ray(rayOrigin, rayDirection);
 
-      // 시각적 표현용 Ray: Group 1(Wall)만 감지하도록 필터링 (플레이어 투과)
       const hit = world.castRay(
         ray,
         viewDistance,
@@ -252,7 +249,7 @@ const DynamicVisionCone = ({
   });
 
   return (
-    <group position={[0, 1.0, 0]}>
+    <group position={[0, 0.05, 0]}>
       <mesh ref={meshYellowRef} position={[0, -0.01, 0]} frustumCulled={false}>
         <bufferGeometry ref={geoYellowRef}>
           <bufferAttribute attach="attributes-position" count={vertexCount} array={positionsYellow} itemSize={3} />
@@ -328,22 +325,20 @@ const Enemy = ({ path }: { path: Vector3[] }) => {
 
             if (MathUtils.radToDeg(angleFlat) < FOV / 2 && verticalAngle < VERTICAL_FOV) {
 
-              const targetHeightOffset = isCrouching ? 0.5 : 1.5;
-              const rayStartPos = { x: currentPos.x, y: currentPos.y + 1.5, z: currentPos.z };
+              const targetHeightOffset = isCrouching ? 0.9 : 1.7;
+              const rayStartPos = { x: currentPos.x, y: currentPos.y + 1.7, z: currentPos.z };
               const playerTargetPos = new ThreeVector3(playerPosition.x, playerPosition.y + targetHeightOffset, playerPosition.z);
 
               const rayDir = new ThreeVector3().subVectors(playerTargetPos, new ThreeVector3(rayStartPos.x, rayStartPos.y, rayStartPos.z)).normalize();
               const ray = new rapier.Ray(rayStartPos, rayDir);
               const exactDistToTarget = new ThreeVector3(rayStartPos.x, rayStartPos.y, rayStartPos.z).distanceTo(playerTargetPos);
 
-              // 🚀 [감지 Ray]: 4번째 인자 flags: 2 (EXCLUDE_DYNAMIC)
-              // 동적 물체(플레이어)를 투과하여, 벽(Static)에 가려졌는지만 확인합니다.
-              // Ray가 아무것도 안 맞으면 -> 플레이어 발각!
+              // 🚀 [핵심] filterFlags: 2 (EXCLUDE_DYNAMIC)
               const hit = world.castRay(
                 ray,
                 exactDistToTarget,
                 true,
-                2,          // 🌟 EXCLUDE_DYNAMIC
+                2,          // 🌟 flags: 2 (EXCLUDE_DYNAMIC)
                 undefined,
                 undefined,
                 rigidBody.current
@@ -352,7 +347,7 @@ const Enemy = ({ path }: { path: Vector3[] }) => {
               let blocked = false;
               if (hit) {
                 const hitDist = (hit as any).toi ?? (hit as any).timeOfImpact;
-                // 플레이어보다 가까운 곳에 벽이 있음
+                // 벽이 플레이어보다 가까이 있으면 차단됨
                 if (hitDist < exactDistToTarget - 0.2) {
                   blocked = true;
                 }
@@ -485,7 +480,20 @@ const PlayerVisuals = ({ scene, animations, currentAnimation, isGhost = false }:
       });
     } else {
       scene.traverse((child: any) => {
-        if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; }
+        if (child.isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+
+          // 🚀 [수정] 자가 투과 방지 (Self-Transparency Issue Fix)
+          // 모델 재질을 강제로 불투명하게 설정하고 깊이 버퍼에 기록하게 합니다.
+          if (child.material) {
+            child.material.transparent = false; // 투명도 끔
+            child.material.opacity = 1.0;       // 완전 불투명
+            child.material.depthWrite = true;   // 깊이 기록 (앞뒤 구분)
+            child.material.depthTest = true;    // 깊이 테스트
+            child.material.needsUpdate = true;  // 변경사항 적용
+          }
+        }
       });
     }
   }, [scene, isGhost]);
@@ -606,7 +614,7 @@ const Player = ({ isLive, orbitControlsRef }: any) => {
   return (
     <RigidBody ref={rigidBody} position={START_POSITION} enabledRotations={[false, false, false]} colliders={false} friction={0.0} gravityScale={2.6} ccd mass={1}>
       <BallCollider args={[0.3]} position={[0, 0.3, 0]} friction={0} />
-      <CapsuleCollider args={isCrouching ? [0.025, 0.58] : [0.3, 0.4]} position={isCrouching ? [0, 0.7, 0] : [0, 0.8, 0]} />
+      <CapsuleCollider args={localCrouch ? [0.025, 0.58] : [0.3, 0.4]} position={localCrouch ? [0, 0.7, 0] : [0, 0.8, 0]} />
       {!isLive && <Html position={[0, 2.5, 0]} center><div ref={posDebugRef} style={{fontFamily: 'monospace', fontSize: '12px', color: '#00ff00', background: 'rgba(0,0,0,0.7)', padding: '4px 8px', borderRadius: '4px', whiteSpace: 'pre', pointerEvents: 'none', userSelect: 'none'}}>Loading...</div></Html>}
       <group ref={rotationGroup}>
         <group scale={0.8}><PlayerVisuals scene={scene} animations={animations} currentAnimation={animation} isGhost={false} /></group>
@@ -631,13 +639,14 @@ const Level = () => {
 
   return (
     <group>
+      {/* RigidBody에 collisionGroups 적용 (Level Group 1) */}
       <RigidBody type="fixed" colliders={false} collisionGroups={GROUP_LEVEL}>
         <MeshCollider type="trimesh">
           <primitive object={scene} />
         </MeshCollider>
       </RigidBody>
 
-      <Bush position={[-19, 0, 15]} />
+      <Bush position={[-15, 0, 15]} />
       <Bush position={[-26, 0, 10]} />
 
       <Enemy path={[
